@@ -15,12 +15,11 @@ import os
 import json
 from openai import OpenAI
 from dotenv import load_dotenv
+from collections import OrderedDict
+import gc
 
 # Load environment variables from .env file
 load_dotenv()
-import os
-import json
-from openai import OpenAI
 
 # Create FastAPI application instance
 app = FastAPI(
@@ -42,11 +41,38 @@ app.add_middleware(
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# In-memory cache for storing processed content results
+# Bounded in-memory cache for storing processed content results
 # Key: MD5 hash of file content, Value: AI processing result
-content_cache = {}
+# Max size: 100 entries; uses LRU eviction policy
+class BoundedCache:
+    def __init__(self, max_size: int = 100):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+    
+    def get(self, key: str):
+        if key in self.cache:
+            # Move to end (most recently used)
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
+    
+    def set(self, key: str, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        
+        # Evict oldest entry if cache exceeds max size
+        if len(self.cache) > self.max_size:
+            oldest_key = next(iter(self.cache))
+            del self.cache[oldest_key]
+            gc.collect()  # Force garbage collection
 
-async def generate_study_materials_with_ai(text_content: str) -> dict:
+content_cache = BoundedCache(max_size=100)
+
+# Max file size: 50MB
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+async def generate_study_materials_with_ai(text_content: str, timeout: int = 30) -> dict:
     """
     Generate study materials using OpenAI API.
 
@@ -90,7 +116,8 @@ Return ONLY a valid JSON object with this exact structure:
                 {"role": "user", "content": prompt}
             ],
             max_tokens=1500,  # Limit token usage
-            temperature=0.7
+            temperature=0.7,
+            timeout=timeout  # 30 second timeout
         )
 
         # Parse the JSON response
@@ -180,9 +207,9 @@ async def process_content(content: dict):
 @app.post("/generate")
 async def generate_study_materials(file: UploadFile = File(...)):
     """
-    Generate study materials from uploaded PDF file.
+    Generate study materials from uploaded slide file.
 
-    This endpoint processes PDF files to generate:
+    This endpoint processes PDF or PowerPoint files to generate:
     - Multiple choice questions (MCQs)
     - Theory questions
     - Flashcards
@@ -191,34 +218,70 @@ async def generate_study_materials(file: UploadFile = File(...)):
     Uses caching based on file content hash to avoid reprocessing.
 
     Args:
-        file: PDF file to process
+        file: Slide file to process
 
     Returns:
         dict: Generated study materials with MCQs, theory questions, flashcards, and summary
     """
-    # Read file content
-    file_content = await file.read()
+    allowed_mimetypes = {
+        "application/pdf",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    }
+    allowed_extensions = {".pdf", ".ppt", ".pptx"}
+    filename_lower = file.filename.lower()
+    file_extension = os.path.splitext(filename_lower)[1]
+
+    if file.content_type not in allowed_mimetypes and file_extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Please upload a PDF, PPT, or PPTX file."
+        )
+
+    # Read file content with size check
+    file_content = b""
+    try:
+        while True:
+            chunk = await file.read(8192)  # Read in 8KB chunks
+            if not chunk:
+                break
+            file_content += chunk
+            
+            # Check file size limit
+            if len(file_content) > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File size exceeds {MAX_FILE_SIZE / (1024 * 1024):.0f}MB limit"
+                )
+    finally:
+        # Ensure file is closed and cleaned up
+        await file.close()
 
     # Convert to text (basic decoding for now)
     # TODO: Implement proper PDF text extraction
     try:
-        text_content = file_content.decode('utf-8')
-    except UnicodeDecodeError:
-        # Fallback for binary content - convert to string representation
-        text_content = str(file_content)
+        text_content = file_content.decode('utf-8', errors='ignore')
+    except Exception:
+        # Fallback: truncate to text representation
+        text_content = str(file_content)[:10000]
+
+    # Clean up large file_content from memory
+    del file_content
+    gc.collect()
 
     # Generate MD5 hash of the content
     content_hash = hashlib.md5(text_content.encode('utf-8')).hexdigest()
 
     # Check if result is already cached
-    if content_hash in content_cache:
-        return content_cache[content_hash]
+    cached_result = content_cache.get(content_hash)
+    if cached_result:
+        return cached_result
 
     # Generate AI response using OpenAI
-    ai_response = await generate_study_materials_with_ai(text_content)
+    ai_response = await generate_study_materials_with_ai(text_content, timeout=30)
 
     # Store result in cache
-    content_cache[content_hash] = ai_response
+    content_cache.set(content_hash, ai_response)
 
     return ai_response
 
