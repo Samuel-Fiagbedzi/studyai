@@ -14,7 +14,7 @@ import uvicorn
 import hashlib
 import os
 import json
-import google.generativeai as genai
+import google.genai as genai
 from dotenv import load_dotenv
 from collections import OrderedDict
 import gc
@@ -44,7 +44,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
+    google_client = genai.Client(api_key=GOOGLE_API_KEY)
 
 openai_client = None
 if OPENAI_API_KEY:
@@ -121,17 +121,15 @@ Return ONLY a valid JSON object with this exact structure:
     try:
         if GOOGLE_API_KEY:
             def google_request() -> str:
-                response = genai.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "You are an educational assistant that creates study materials. Always return valid JSON."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_output_tokens=1500,
-                    temperature=0.7,
-                    timeout=timeout,
+                response = google_client.models.generate_content(
+                    model="gemini-2.0-flash-exp",
+                    contents=prompt,
+                    config=genai.GenerateContentConfig(
+                        temperature=0.7,
+                        max_output_tokens=1500,
+                    )
                 )
-                return response.choices[0].message.content.strip()
+                return response.text
 
             result_text = await asyncio.to_thread(google_request)
         else:
