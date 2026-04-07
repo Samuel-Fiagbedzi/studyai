@@ -9,11 +9,12 @@ and AI processing for educational content.
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+import asyncio
 import uvicorn
 import hashlib
 import os
 import json
-from openai import OpenAI
+import google.generativeai as genai
 from dotenv import load_dotenv
 from collections import OrderedDict
 import gc
@@ -38,8 +39,17 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
-# Initialize OpenAI client
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Initialize AI clients
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+
+openai_client = None
+if OPENAI_API_KEY:
+    from openai import OpenAI
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Bounded in-memory cache for storing processed content results
 # Key: MD5 hash of file content, Value: AI processing result
@@ -82,8 +92,8 @@ async def generate_study_materials_with_ai(text_content: str, timeout: int = 30)
     Returns:
         dict: Structured study materials with mcq, theory, flashcards, and summary
     """
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+    if not GOOGLE_API_KEY and not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="No AI API key configured. Set GOOGLE_API_KEY or OPENAI_API_KEY.")
 
     # Truncate text if too long to reduce token usage (keep first 4000 characters)
     truncated_text = text_content[:4000] if len(text_content) > 4000 else text_content
@@ -109,19 +119,33 @@ Return ONLY a valid JSON object with this exact structure:
 """
 
     try:
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are an educational assistant that creates study materials. Always return valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=1500,  # Limit token usage
-            temperature=0.7,
-            timeout=timeout  # 30 second timeout
-        )
+        if GOOGLE_API_KEY:
+            def google_request() -> str:
+                response = genai.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are an educational assistant that creates study materials. Always return valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    max_output_tokens=1500,
+                    temperature=0.7,
+                    timeout=timeout,
+                )
+                return response.choices[0].message.content.strip()
 
-        # Parse the JSON response
-        result_text = response.choices[0].message.content.strip()
+            result_text = await asyncio.to_thread(google_request)
+        else:
+            response = openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an educational assistant that creates study materials. Always return valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1500,  # Limit token usage
+                temperature=0.7,
+                timeout=timeout
+            )
+            result_text = response.choices[0].message.content.strip()
 
         # Try to parse as JSON
         try:
