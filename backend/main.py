@@ -84,7 +84,7 @@ MAX_FILE_SIZE = 50 * 1024 * 1024
 
 async def generate_study_materials_with_ai(text_content: str, timeout: int = 30) -> dict:
     """
-    Generate study materials using OpenAI API.
+    Generate study materials using AI API with real content processing.
 
     Args:
         text_content: The extracted text content from the document
@@ -122,9 +122,9 @@ Return ONLY a valid JSON object with this exact structure:
         if GOOGLE_API_KEY:
             def google_request() -> str:
                 response = google_client.models.generate_content(
-                    model="gemini-2.0-flash-exp",
+                    model="gemini-1.5-flash",
                     contents=prompt,
-                    config=genai.GenerateContentConfig(
+                    config=genai.types.GenerateContentConfig(
                         temperature=0.7,
                         max_output_tokens=1500,
                     )
@@ -165,7 +165,7 @@ Return ONLY a valid JSON object with this exact structure:
             }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI API error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI API error: {str(e)}")
 
 @app.get("/")
 async def root():
@@ -249,8 +249,9 @@ async def generate_study_materials(file: UploadFile = File(...)):
         "application/pdf",
         "application/vnd.ms-powerpoint",
         "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "text/plain",
     }
-    allowed_extensions = {".pdf", ".ppt", ".pptx"}
+    allowed_extensions = {".pdf", ".ppt", ".pptx", ".txt"}
     filename_lower = file.filename.lower()
     file_extension = os.path.splitext(filename_lower)[1]
 
@@ -279,13 +280,31 @@ async def generate_study_materials(file: UploadFile = File(...)):
         # Ensure file is closed and cleaned up
         await file.close()
 
-    # Convert to text (basic decoding for now)
-    # TODO: Implement proper PDF text extraction
+    # Extract text from PDF
     try:
-        text_content = file_content.decode('utf-8', errors='ignore')
-    except Exception:
-        # Fallback: truncate to text representation
-        text_content = str(file_content)[:10000]
+        from PyPDF2 import PdfReader
+        from io import BytesIO
+        
+        # Create a PDF reader from the file content
+        pdf_file = BytesIO(file_content)
+        pdf_reader = PdfReader(pdf_file)
+        
+        # Extract text from all pages
+        text_content = ""
+        for page in pdf_reader.pages:
+            text_content += page.extract_text() + "\n"
+        
+        # If no text was extracted, fall back to basic decoding
+        if not text_content.strip():
+            text_content = file_content.decode('utf-8', errors='ignore')
+            
+    except Exception as e:
+        # Fallback: basic decoding if PDF extraction fails
+        print(f"PDF extraction failed: {e}, using fallback method")
+        try:
+            text_content = file_content.decode('utf-8', errors='ignore')
+        except Exception:
+            text_content = str(file_content)[:10000]
 
     # Clean up large file_content from memory
     del file_content
