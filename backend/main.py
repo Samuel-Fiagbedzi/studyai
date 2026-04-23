@@ -43,13 +43,27 @@ app.add_middleware(
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Validate API keys if provided (basic length checks)
+if GOOGLE_API_KEY and len(GOOGLE_API_KEY) < 10:
+    print("Warning: GOOGLE_API_KEY seems too short")
+if OPENAI_API_KEY and not OPENAI_API_KEY.startswith("sk-"):
+    print("Warning: OPENAI_API_KEY should start with 'sk-'")
+
 if GOOGLE_API_KEY:
-    google_client = genai.Client(api_key=GOOGLE_API_KEY)
+    try:
+        google_client = genai.Client(api_key=GOOGLE_API_KEY)
+    except Exception as e:
+        print(f"Failed to initialize Google AI client: {e}")
+        google_client = None
 
 openai_client = None
 if OPENAI_API_KEY:
-    from openai import OpenAI
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    try:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        print(f"Failed to initialize OpenAI client: {e}")
+        openai_client = None
 
 # Bounded in-memory cache for storing processed content results
 # Key: MD5 hash of file content, Value: AI processing result
@@ -75,14 +89,13 @@ class BoundedCache:
         if len(self.cache) > self.max_size:
             oldest_key = next(iter(self.cache))
             del self.cache[oldest_key]
-            gc.collect()  # Force garbage collection
 
 content_cache = BoundedCache(max_size=100)
 
 # Max file size: 50MB
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
-async def generate_study_materials_with_ai(text_content: str, timeout: int = 30) -> dict:
+async def generate_study_materials_with_ai(text_content: str, timeout: int = 300) -> dict:
     """
     Generate study materials using AI API with real content processing.
 
@@ -153,12 +166,14 @@ Return ONLY a valid JSON object with this exact structure:
             if not all(key in result for key in required_keys):
                 raise ValueError("Missing required keys in response")
 
+            # Rename 'mcq' to 'mcqs' for frontend compatibility
+            result["mcqs"] = result.pop("mcq")
             return result
 
         except (json.JSONDecodeError, ValueError) as e:
             # Fallback: create structured response from text
             return {
-                "mcq": ["Error parsing MCQ questions"],
+                "mcqs": ["Error parsing MCQ questions"],
                 "theory": ["Error parsing theory questions"],
                 "flashcards": ["Error parsing flashcards"],
                 "summary": f"Content processed but parsing failed: {str(e)}"
@@ -268,14 +283,15 @@ async def generate_study_materials(file: UploadFile = File(...)):
             chunk = await file.read(8192)  # Read in 8KB chunks
             if not chunk:
                 break
-            file_content += chunk
-            
-            # Check file size limit
-            if len(file_content) > MAX_FILE_SIZE:
+
+            # Check file size limit before adding chunk
+            if len(file_content) + len(chunk) > MAX_FILE_SIZE:
                 raise HTTPException(
                     status_code=413,
                     detail=f"File size exceeds {MAX_FILE_SIZE / (1024 * 1024):.0f}MB limit"
                 )
+
+            file_content += chunk
     finally:
         # Ensure file is closed and cleaned up
         await file.close()
@@ -299,16 +315,17 @@ async def generate_study_materials(file: UploadFile = File(...)):
             text_content = file_content.decode('utf-8', errors='ignore')
             
     except Exception as e:
-        # Fallback: basic decoding if PDF extraction fails
+        # Fallback: basic decoding with size limits to prevent memory issues
         print(f"PDF extraction failed: {e}, using fallback method")
         try:
-            text_content = file_content.decode('utf-8', errors='ignore')
+            # Limit the content size before decoding to prevent memory issues
+            max_decode_size = min(len(file_content), 10 * 1024 * 1024)  # Max 10MB for decoding
+            text_content = file_content[:max_decode_size].decode('utf-8', errors='ignore')
         except Exception:
+            # Final fallback: convert to string representation with size limit
             text_content = str(file_content)[:10000]
 
-    # Clean up large file_content from memory
-    del file_content
-    gc.collect()
+    # File content will be garbage collected automatically
 
     # Generate MD5 hash of the content
     content_hash = hashlib.md5(text_content.encode('utf-8')).hexdigest()
@@ -318,8 +335,8 @@ async def generate_study_materials(file: UploadFile = File(...)):
     if cached_result:
         return cached_result
 
-    # Generate AI response using OpenAI
-    ai_response = await generate_study_materials_with_ai(text_content, timeout=30)
+    # Generate AI response using configured AI provider
+    ai_response = await generate_study_materials_with_ai(text_content)
 
     # Store result in cache
     content_cache.set(content_hash, ai_response)
