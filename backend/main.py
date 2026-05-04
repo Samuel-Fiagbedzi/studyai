@@ -14,10 +14,16 @@ import uvicorn
 import hashlib
 import os
 import json
-import google.genai as genai
+import requests
 from dotenv import load_dotenv
 from collections import OrderedDict
 import gc
+try:
+    from PyPDF2 import PdfReader
+    PYPDF2_AVAILABLE = True
+except ImportError:
+    PYPDF2_AVAILABLE = False
+from io import BytesIO
 
 # Load environment variables from .env file
 load_dotenv()
@@ -39,31 +45,12 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
 )
 
-# Initialize AI clients
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# Initialize Groq API key
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Validate API keys if provided (basic length checks)
-if GOOGLE_API_KEY and len(GOOGLE_API_KEY) < 10:
-    print("Warning: GOOGLE_API_KEY seems too short")
-if OPENAI_API_KEY and not OPENAI_API_KEY.startswith("sk-"):
-    print("Warning: OPENAI_API_KEY should start with 'sk-'")
-
-if GOOGLE_API_KEY:
-    try:
-        google_client = genai.Client(api_key=GOOGLE_API_KEY)
-    except Exception as e:
-        print(f"Failed to initialize Google AI client: {e}")
-        google_client = None
-
-openai_client = None
-if OPENAI_API_KEY:
-    try:
-        from openai import OpenAI
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        print(f"Failed to initialize OpenAI client: {e}")
-        openai_client = None
+# Validate API key if provided
+if GROQ_API_KEY and len(GROQ_API_KEY) < 10:
+    print("Warning: GROQ_API_KEY seems too short")
 
 # Bounded in-memory cache for storing processed content results
 # Key: MD5 hash of file content, Value: AI processing result
@@ -105,8 +92,8 @@ async def generate_study_materials_with_ai(text_content: str, timeout: int = 300
     Returns:
         dict: Structured study materials with mcq, theory, flashcards, and summary
     """
-    if not GOOGLE_API_KEY and not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="No AI API key configured. Set GOOGLE_API_KEY or OPENAI_API_KEY.")
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="No GROQ_API_KEY configured.")
 
     # Truncate text if too long to reduce token usage (keep first 4000 characters)
     truncated_text = text_content[:4000] if len(text_content) > 4000 else text_content
@@ -132,31 +119,56 @@ Return ONLY a valid JSON object with this exact structure:
 """
 
     try:
-        if GOOGLE_API_KEY:
-            def google_request() -> str:
-                response = google_client.models.generate_content(
-                    model="gemini-1.5-flash",
-                    contents=prompt,
-                    config=genai.types.GenerateContentConfig(
-                        temperature=0.7,
-                        max_output_tokens=1500,
-                    )
+        def groq_request() -> str:
+            try:
+                response = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "openai/gpt-oss-120b",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.7,
+                        "max_tokens": 1500
+                    },
+                    timeout=timeout
                 )
-                return response.text
+                result = response.json()
+                return result["choices"][0]["message"]["content"]
+            except Exception as groq_error:
+                error_msg = str(groq_error).lower()
+                if any(x in error_msg for x in ["503", "unavailable", "rate limit", "429"]):
+                    print(f"Primary Groq model unavailable, trying llama3-8b-8192...")
+                    try:
+                        response = requests.post(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            headers={
+                                "Authorization": f"Bearer {GROQ_API_KEY}",
+                                "Content-Type": "application/json"
+                            },
+                            json={
+                                "model": "llama3-8b-8192",
+                                "messages": [{"role": "user", "content": prompt}],
+                                "temperature": 0.7,
+                                "max_tokens": 1500
+                            },
+                            timeout=timeout
+                        )
+                        result = response.json()
+                        return result["choices"][0]["message"]["content"]
+                    except Exception as fallback_error:
+                        print(f"Fallback model also failed: {fallback_error}")
+                        return json.dumps({
+                            "mcq": ["What is the main topic discussed? A) Topic A B) Topic C) Topic D [Correct: A]"],
+                            "theory": ["Explain the main concept discussed in the content."],
+                            "flashcards": ["Key Term: Definition or explanation from the content"],
+                            "summary": "The content has been processed. Due to high API demand, a simplified response was generated."
+                        })
+                raise groq_error
 
-            result_text = await asyncio.to_thread(google_request)
-        else:
-            response = openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are an educational assistant that creates study materials. Always return valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=1500,  # Limit token usage
-                temperature=0.7,
-                timeout=timeout
-            )
-            result_text = response.choices[0].message.content.strip()
+        result_text = await asyncio.to_thread(groq_request)
 
         # Try to parse as JSON
         try:
@@ -298,8 +310,8 @@ async def generate_study_materials(file: UploadFile = File(...)):
 
     # Extract text from PDF
     try:
-        from PyPDF2 import PdfReader
-        from io import BytesIO
+        if not PYPDF2_AVAILABLE:
+            raise ImportError("PyPDF2 is not installed")
         
         # Create a PDF reader from the file content
         pdf_file = BytesIO(file_content)
